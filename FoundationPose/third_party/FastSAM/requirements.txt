@@ -1,0 +1,17 @@
+# Base-----------------------------------
+matplotlib
+opencv-python
+Pillow
+PyYAML
+requests
+scipy
+tqdm
+pandas
+seaborn
+gradio
+
+# Ultralytics-----------------------------------
+# ultralytics == 8.0.120
+
+# torch>=1.7.0
+# torchvision>=0.8.1

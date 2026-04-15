@@ -1,0 +1,5 @@
+# Extra dependencies for demo/run_demo_realsense.py (install on top of FoundationPose env).
+pyyaml>=6.0
+pyrealsense2; platform_system != "Windows"
+# Cutie (third_party/Cutie): pip install -e ../third_party/Cutie
+# scipy: already required by FoundationPose / KalmanFilter6D

@@ -1,0 +1,78 @@
+camera:
+  width: 640
+  height: 480
+  fps: 30
+  target_width: 640
+  target_height: 480
+  depth_scale_override: null
+  # Timeouts for pipeline.wait_for_frames (sync path and grab thread). USB/load spikes may need 10s+.
+  async_first_frame_timeout_ms: 8000
+  async_frame_timeout_ms: 10000
+  # Main loop read timeout to keep GUI responsive when camera temporarily stalls.
+  main_loop_frame_timeout_ms: 1000
+  # Auto-restart RealSense pipeline after this many consecutive read timeouts.
+  recover_after_consecutive_timeouts: 3
+  camera_restart_cooldown_s: 0.3
+  wait_for_frames_retries: 3
+  grab_failures_before_abort: 200
+
+sync:
+  tolerance_ms: 33.0
+
+mesh:
+  file: "../../assets/meshes/bottle/bottle.obj"
+
+fastsam:
+  model_path: "../../third_party/FastSAM/weights/FastSAM-s.pt"
+  device: "auto"
+  imgsz: 1024
+  conf: 0.75
+  iou: 0.9
+  retina_masks: false
+
+tracker:
+  est_refine_iter: 2
+  track_refine_iter: 1
+  rot_grid_min_views: 16
+  rot_grid_inplane_step: 90
+  score_max_candidates: 96
+  render_bs_cap: 32
+  score_render_bs_cap: 12
+  score_forward_bs_cap: 24
+  max_translation_jump_m: 0.35
+  max_rotation_jump_deg: 70
+  min_mask_pixels: 64
+
+# FoundationPose++-style: Cutie 2D bbox + optional KalmanFilter6D on pose_last before track_one.
+fpp:
+  cutie_enabled: true
+  kalman_6d_enabled: true
+  # cutie_enabled: false
+  # kalman_6d_enabled: false
+  kf_measurement_noise_scale: 1.0
+  draw_cutie_bbox: true
+  # If true, clear click mask when tracker reports pose jump / reinit_required.
+  clear_mask_on_pose_reinit: false
+
+cutie:
+  seg_threshold: 0.1
+  erosion_size: 5
+  max_internal_size: 480
+
+performance:
+  # Set true to decouple capture from inference (latest frame only). Tune async_*_timeout_ms under camera if needed.
+  async_camera: false
+  fast_depth_filter: false
+
+visualization:
+  axis_scale_m: 0.1
+  axis_thickness: 3
+
+offline:
+  replay_dir: ""
+  record_dir: ""
+
+debug:
+  level: 0
+  dir: "../../debug/demo"
+  hz_log_interval_s: 2.0
