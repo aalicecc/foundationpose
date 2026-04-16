@@ -20,8 +20,8 @@ sync:
   tolerance_ms: 33.0
 
 mesh:
-  file: "../../assets/meshes/pika/pika_origin.obj"
-  # file: "../../assets/meshes/bottle/bottle.obj"
+  # file: "../../assets/meshes/white_diamond/white_diamond.obj"
+  file: "../../assets/meshes/bottle/bottle.obj"
 
 fastsam:
   model_path: "../../third_party/FastSAM/weights/FastSAM-s.pt"
@@ -44,12 +44,31 @@ tracker:
   score_forward_bs_cap: 24
   max_translation_jump_m: 0.35
   max_rotation_jump_deg: 70
+  # max_translation_jump_m: 0.20
+  # max_rotation_jump_deg: 45.0
   min_mask_pixels: 64
+
+# Multi-metric drift gate (replaces single combined translation jump when enabled).
+drift:
+  enabled: true
+  max_xy_jump_m: 0.35
+  max_z_jump_m: 0.28
+  max_rot_deg: 70
+  max_rpy_rate_deg_s: 480
+  max_z_depth_residual_m: 0.10
+  min_depth_valid_ratio: 0.18
+  bad_frames_for_reinit: 5
+  suspect_ratio: 0.55
+  z_median_blend: 0.42
+  rotation_slerp: 0.5
+  z_median_blend_depth_recovery: 0.72
 
 # FoundationPose++-style: Cutie 2D bbox + optional KalmanFilter6D on pose_last before track_one.
 fpp:
   cutie_enabled: true
   kalman_6d_enabled: true
+  # When kf_continue: keep roll/pitch from last stable pose, yaw from KF prediction.
+  lock_roll_pitch_on_kf_continue: false
   # On pose jump:
   # - reuse_mask: existing behavior, may re-register with cached init mask
   # - kf_continue: keep outputting pose via KF-assisted continuation, skip mask re-register

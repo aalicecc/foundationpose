@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     
 from Utils import draw_posed_3d_box, draw_xyz_axis, set_logging_format, set_seed
 from demo.fpp.kalman_filter_6d import KalmanFilter6D
-from demo.fpp.pose_utils import get_mat_from_6d_pose_arr
+from demo.fpp.pose_utils import get_mat_from_6d_pose_arr, lock_roll_pitch_keep_yaw
 from demo.io.frame_sync import TimestampSyncer
 from demo.io.realsense_stream import RealSenseStream, ReplayRecorder, ReplayStream
 from demo.seg.fastsam_bridge import build_fastsam_bridge
@@ -191,6 +191,7 @@ def build_demo_components(cfg: Dict, args) -> Dict:
     debug=cfg["debug"]["level"],
     debug_dir=cfg["debug"]["dir"],
     fast_depth_filter=bool(perf.get("fast_depth_filter", False)),
+    drift=cfg.get("drift"),
   )
   fastsam_bridge = build_fastsam_bridge(cfg, args)
   syncer = TimestampSyncer(tolerance_ms=cfg["sync"]["tolerance_ms"])
@@ -231,6 +232,7 @@ def main():
     logging.warning("Unknown fpp.pose_recovery_mode=%s, fallback to reuse_mask", pose_recovery_mode)
     pose_recovery_mode = "reuse_mask"
   kf_continue_max_frames = max(0, int(fpp_cfg.get("kf_continue_max_frames", 30)))
+  lock_roll_pitch_on_kf_continue = bool(fpp_cfg.get("lock_roll_pitch_on_kf_continue", False))
   fastsam_cfg = cfg.get("fastsam", {})
   release_fastsam_after_first_register = bool(
     fastsam_cfg.get(
@@ -271,6 +273,7 @@ def main():
   kf_predict_count_window = 0
   kf_predict_window_start = time.perf_counter()
   last_vis_bgr: Optional[np.ndarray] = None
+  last_stable_R: Optional[np.ndarray] = None
 
   if not args.no_gui:
     cv2.namedWindow("foundationpose_demo", cv2.WINDOW_NORMAL)
@@ -312,6 +315,7 @@ def main():
 
   try:
     while True:
+      result = None
       should_quit = False
       if args.mode == "offline":
         try:
@@ -396,6 +400,8 @@ def main():
         click.clear()
         tracker.initialized = False
         tracker.last_pose = None
+        tracker.reset_drift_state()
+        last_stable_R = None
         if cutie_tracker is not None:
           del cutie_tracker
           torch.cuda.empty_cache()
@@ -486,8 +492,18 @@ def main():
               kf_update_hz_inst = 1.0 / kf_update_dt
               kf_update_hz_ema = kf_update_hz_inst if kf_update_hz_ema <= 0 else (0.9 * kf_update_hz_ema + 0.1 * kf_update_hz_inst)
             kf_update_count_window += 1
+        mask_for_drift = None
+        if cutie_enabled and cutie_tracker is not None:
+          mask_for_drift = getattr(cutie_tracker, "last_mask_u8", None)
+          mask_for_drift = ensure_mask_matches_depth(mask_for_drift, depth)
         t_pred_start = time.perf_counter()
-        result = tracker.track(K=K, rgb=rgb, depth=depth, timestamp_ms=frame.timestamp_ms)
+        result = tracker.track(
+          K=K,
+          rgb=rgb,
+          depth=depth,
+          timestamp_ms=frame.timestamp_ms,
+          mask_u8=mask_for_drift,
+        )
         pred_dt = time.perf_counter() - t_pred_start
         if pred_dt >= 0.002:
           pred_hz_inst = 1.0 / pred_dt
@@ -524,6 +540,9 @@ def main():
             kf_predict_hz_ema = kf_predict_hz_inst if kf_predict_hz_ema <= 0 else (0.9 * kf_predict_hz_ema + 0.1 * kf_predict_hz_inst)
           kf_predict_count_window += 1
           predicted_pose = get_mat_from_6d_pose_arr(kf_mean[:6]).astype(np.float32)
+          if lock_roll_pitch_on_kf_continue and last_stable_R is not None:
+            predicted_pose = predicted_pose.copy()
+            predicted_pose[:3, :3] = lock_roll_pitch_keep_yaw(predicted_pose[:3, :3], last_stable_R)
           pose = predicted_pose
           tracker.initialized = True
           tracker.last_pose = predicted_pose.copy()
@@ -544,6 +563,9 @@ def main():
           )
         elif result.state == "reinit_required":
           kf_continue_frames = 0
+
+        if pose is not None and tracker.initialized and last_state == "tracking":
+          last_stable_R = pose[:3, :3].copy()
 
       now_perf = time.perf_counter()
       if (now_perf - pred_window_start) >= pred_log_interval_s:
@@ -669,6 +691,22 @@ def main():
         (0, 255, 0),
         2,
       )
+      drift_line = "drift: n/a"
+      if tracker.initialized and pose is not None and result is not None:
+        drift_line = (
+          f"q={result.quality_state} zres={result.z_depth_residual_m:.3f} "
+          f"vld={result.depth_valid_ratio:.2f} rr={result.rpy_rate_deg_s:.0f}/s "
+          f"dbc={result.consecutive_depth_bad_frames}"
+        )
+      cv2.putText(
+        vis_bgr,
+        drift_line[:120],
+        (8, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (180, 220, 255),
+        1,
+      )
       last_vis_bgr = vis_bgr.copy()
       if not args.no_gui:
         cv2.imshow("foundationpose_demo", vis_bgr)
@@ -682,6 +720,8 @@ def main():
         init_mask_u8 = None
         tracker.initialized = False
         tracker.last_pose = None
+        tracker.reset_drift_state()
+        last_stable_R = None
         if cutie_tracker is not None:
           del cutie_tracker
           torch.cuda.empty_cache()

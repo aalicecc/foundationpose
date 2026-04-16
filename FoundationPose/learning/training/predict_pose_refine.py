@@ -9,7 +9,6 @@
 
 import functools
 import os,sys,kornia
-import time
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../../')
 import numpy as np
@@ -19,7 +18,6 @@ from learning.models.refine_network import RefineNet
 from learning.datasets.h5_dataset import *
 from Utils import *
 from datareader import *
-
 
 
 @torch.inference_mode()

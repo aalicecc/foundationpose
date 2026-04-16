@@ -9,7 +9,6 @@
 
 import functools
 import os,sys,kornia
-import time
 import numpy as np
 import torch
 import torch.distributed as dist
