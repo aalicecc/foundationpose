@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     
 from Utils import draw_posed_3d_box, draw_xyz_axis, set_logging_format, set_seed
 from demo.fpp.kalman_filter_6d import KalmanFilter6D
+from demo.fpp.pose_utils import get_mat_from_6d_pose_arr
 from demo.io.frame_sync import TimestampSyncer
 from demo.io.realsense_stream import RealSenseStream, ReplayRecorder, ReplayStream
 from demo.seg.fastsam_bridge import build_fastsam_bridge
@@ -196,6 +197,12 @@ def build_demo_components(cfg: Dict, args) -> Dict:
   return {"tracker": tracker, "fastsam": fastsam_bridge, "syncer": syncer}
 
 
+def _is_valid_bbox_xywh(bbox_xywh) -> bool:
+  if bbox_xywh is None or len(bbox_xywh) < 4:
+    return False
+  return (bbox_xywh[0] >= 0) and (bbox_xywh[2] > 0) and (bbox_xywh[3] > 0)
+
+
 def main():
   args = parse_args()
   cfg = load_config(args.config)
@@ -215,13 +222,31 @@ def main():
   kalman_6d_enabled = bool(fpp_cfg.get("kalman_6d_enabled", False)) and cutie_enabled
   draw_cutie_bbox = bool(fpp_cfg.get("draw_cutie_bbox", False))
   clear_mask_on_pose_reinit = bool(fpp_cfg.get("clear_mask_on_pose_reinit", False))
+  vis_cfg = cfg.get("visualization", {})
+  show_cutie_mask_overlay = bool(vis_cfg.get("show_cutie_mask_overlay", False))
+  cutie_mask_alpha = float(vis_cfg.get("cutie_mask_alpha", 0.35))
+  cutie_mask_alpha = max(0.0, min(1.0, cutie_mask_alpha))
+  pose_recovery_mode = str(fpp_cfg.get("pose_recovery_mode", "reuse_mask")).strip().lower()
+  if pose_recovery_mode not in {"reuse_mask", "kf_continue"}:
+    logging.warning("Unknown fpp.pose_recovery_mode=%s, fallback to reuse_mask", pose_recovery_mode)
+    pose_recovery_mode = "reuse_mask"
+  kf_continue_max_frames = max(0, int(fpp_cfg.get("kf_continue_max_frames", 30)))
+  fastsam_cfg = cfg.get("fastsam", {})
+  release_fastsam_after_first_register = bool(
+    fastsam_cfg.get(
+      "release_fastsam_after_init",
+      fastsam_cfg.get("release_after_first_register", True),
+    )
+  )
 
   click = ClickPromptState()
   init_mask_u8: Optional[np.ndarray] = None
   cutie_tracker = None
+  fastsam_released = False
   kf_6d: Optional[KalmanFilter6D] = None
   kf_mean: Optional[np.ndarray] = None
   kf_cov: Optional[np.ndarray] = None
+  kf_continue_frames = 0
   last_cutie_bbox = None
   last_sync_error_ms = -1.0
   last_state = "waiting_init"
@@ -237,6 +262,14 @@ def main():
   box_count_window = 0
   box_window_start = time.perf_counter()
   box_last_ts = None
+  kf_update_hz_ema = 0.0
+  kf_update_hz_inst = 0.0
+  kf_update_count_window = 0
+  kf_update_window_start = time.perf_counter()
+  kf_predict_hz_ema = 0.0
+  kf_predict_hz_inst = 0.0
+  kf_predict_count_window = 0
+  kf_predict_window_start = time.perf_counter()
   last_vis_bgr: Optional[np.ndarray] = None
 
   if not args.no_gui:
@@ -348,6 +381,11 @@ def main():
       syncer.update_depth(depth, frame.timestamp_ms, frame.frame_id)
 
       if click.request_reinit and len(click.points) > 0:
+        if fastsam_bridge is None:
+          logging.warning("FastSAM already released; click reinit ignored. Restart app to re-enable FastSAM init.")
+          click.request_reinit = False
+          click.clear()
+          continue
         t_fastsam_start = time.perf_counter()
         init_mask_u8 = fastsam_bridge.infer_point_prompt(rgb=rgb, points_xy=click.points, point_labels=click.labels)
         fastsam_ms_last = (time.perf_counter() - t_fastsam_start) * 1000.0
@@ -365,6 +403,7 @@ def main():
         kf_6d = None
         kf_mean = None
         kf_cov = None
+        kf_continue_frames = 0
         last_cutie_bbox = None
       elif init_mask_u8 is not None:
         init_mask_u8 = ensure_mask_matches_depth(init_mask_u8, depth)
@@ -407,13 +446,32 @@ def main():
             if kalman_6d_enabled:
               kf_6d = KalmanFilter6D(float(fpp_cfg.get("kf_measurement_noise_scale", 1.0)))
               kf_mean, kf_cov = FoundationPoseRunner.init_fpp_kalman(result.pose, kf_6d)
+          if result.state == "tracking":
+            kf_continue_frames = 0
+            if release_fastsam_after_first_register and (not fastsam_released) and (fastsam_bridge is not None):
+              del fastsam_bridge
+              fastsam_bridge = None
+              fastsam_released = True
+              torch.cuda.empty_cache()
+              logging.info("FastSAM released after first successful register.")
           last_state = result.state
           last_reason = result.reason
           last_sync_error_ms = sample["sync_error_ms"]
       else:
         last_cutie_bbox = None
+        kf_update_start = None
+        kf_update_ready = False
         if cutie_enabled and cutie_tracker is not None:
+          kf_update_ready = (
+            kalman_6d_enabled
+            and (kf_6d is not None)
+            and (kf_mean is not None)
+            and (kf_cov is not None)
+          )
           last_cutie_bbox = cutie_tracker.track(rgb)
+          kf_update_ready = kf_update_ready and _is_valid_bbox_xywh(last_cutie_bbox) and (tracker.estimator.pose_last is not None)
+          if kf_update_ready:
+            kf_update_start = time.perf_counter()
           kf_mean, kf_cov = tracker.apply_fpp_prior(
             K,
             last_cutie_bbox,
@@ -422,6 +480,12 @@ def main():
             kf_cov,
             use_kalman=kalman_6d_enabled,
           )
+          if kf_update_ready and kf_update_start is not None:
+            kf_update_dt = time.perf_counter() - kf_update_start
+            if kf_update_dt >= 1e-6:
+              kf_update_hz_inst = 1.0 / kf_update_dt
+              kf_update_hz_ema = kf_update_hz_inst if kf_update_hz_ema <= 0 else (0.9 * kf_update_hz_ema + 0.1 * kf_update_hz_inst)
+            kf_update_count_window += 1
         t_pred_start = time.perf_counter()
         result = tracker.track(K=K, rgb=rgb, depth=depth, timestamp_ms=frame.timestamp_ms)
         pred_dt = time.perf_counter() - t_pred_start
@@ -431,11 +495,55 @@ def main():
           pred_count_window += 1
         pose = result.pose
         if kalman_6d_enabled and kf_6d is not None and kf_mean is not None and result.state == "tracking":
+          kf_predict_start = time.perf_counter()
           kf_mean, kf_cov = FoundationPoseRunner.fpp_kalman_predict(kf_6d, kf_mean, kf_cov)
+          kf_predict_dt = time.perf_counter() - kf_predict_start
+          if kf_predict_dt >= 1e-6:
+            kf_predict_hz_inst = 1.0 / kf_predict_dt
+            kf_predict_hz_ema = kf_predict_hz_inst if kf_predict_hz_ema <= 0 else (0.9 * kf_predict_hz_ema + 0.1 * kf_predict_hz_inst)
+          kf_predict_count_window += 1
+          kf_continue_frames = 0
         last_state = result.state
         last_reason = result.reason
         if result.state == "reinit_required" and clear_mask_on_pose_reinit:
           init_mask_u8 = None
+        if (
+          result.state == "reinit_required"
+          and pose_recovery_mode == "kf_continue"
+          and kalman_6d_enabled
+          and (kf_6d is not None)
+          and (kf_mean is not None)
+          and (kf_cov is not None)
+          and (kf_continue_frames < kf_continue_max_frames)
+        ):
+          kf_predict_start = time.perf_counter()
+          kf_mean, kf_cov = FoundationPoseRunner.fpp_kalman_predict(kf_6d, kf_mean, kf_cov)
+          kf_predict_dt = time.perf_counter() - kf_predict_start
+          if kf_predict_dt >= 1e-6:
+            kf_predict_hz_inst = 1.0 / kf_predict_dt
+            kf_predict_hz_ema = kf_predict_hz_inst if kf_predict_hz_ema <= 0 else (0.9 * kf_predict_hz_ema + 0.1 * kf_predict_hz_inst)
+          kf_predict_count_window += 1
+          predicted_pose = get_mat_from_6d_pose_arr(kf_mean[:6]).astype(np.float32)
+          pose = predicted_pose
+          tracker.initialized = True
+          tracker.last_pose = predicted_pose.copy()
+          base_pose_last = tracker.estimator.pose_last
+          if base_pose_last is not None and torch.is_tensor(base_pose_last):
+            tracker.estimator.pose_last = torch.from_numpy(predicted_pose).to(dtype=base_pose_last.dtype, device=base_pose_last.device)
+          else:
+            default_device = "cuda" if torch.cuda.is_available() else "cpu"
+            tracker.estimator.pose_last = torch.from_numpy(predicted_pose).to(device=default_device, dtype=torch.float32)
+          init_mask_u8 = None
+          kf_continue_frames += 1
+          last_state = "tracking"
+          last_reason = f"kf_continue:{result.reason}"
+          logging.warning(
+            "Pose jump detected; continue tracking with KF prior (%d/%d).",
+            kf_continue_frames,
+            kf_continue_max_frames,
+          )
+        elif result.state == "reinit_required":
+          kf_continue_frames = 0
 
       now_perf = time.perf_counter()
       if (now_perf - pred_window_start) >= pred_log_interval_s:
@@ -451,7 +559,16 @@ def main():
         pred_count_window = 0
         pred_window_start = now_perf
 
-      vis_rgb = overlay_mask(rgb, init_mask_u8 if not tracker.initialized else None)
+      cutie_mask_u8 = None
+      if show_cutie_mask_overlay and cutie_enabled and cutie_tracker is not None:
+        cutie_mask_u8 = getattr(cutie_tracker, "last_mask_u8", None)
+        if cutie_mask_u8 is not None and cutie_mask_u8.shape[:2] != rgb.shape[:2]:
+          target_h, target_w = rgb.shape[:2]
+          cutie_mask_u8 = cv2.resize(cutie_mask_u8, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+      if cutie_mask_u8 is not None:
+        vis_rgb = overlay_mask(rgb, cutie_mask_u8, alpha=cutie_mask_alpha)
+      else:
+        vis_rgb = overlay_mask(rgb, init_mask_u8 if not tracker.initialized else None)
       if (
         draw_cutie_bbox
         and last_cutie_bbox is not None
@@ -486,6 +603,30 @@ def main():
         logging.info("box_hz window=%.2f ema=%.2f inst=%.2f n=%d", box_hz_window, box_hz_ema, box_hz_inst, box_count_window)
         box_count_window = 0
         box_window_start = now_perf
+      if (now_perf - kf_update_window_start) >= pred_log_interval_s:
+        kf_update_window_s = max(1e-6, now_perf - kf_update_window_start)
+        kf_update_hz_window = kf_update_count_window / kf_update_window_s
+        logging.info(
+          "kf_hz_update window=%.2f ema=%.2f inst=%.2f n=%d",
+          kf_update_hz_window,
+          kf_update_hz_ema,
+          kf_update_hz_inst,
+          kf_update_count_window,
+        )
+        kf_update_count_window = 0
+        kf_update_window_start = now_perf
+      if (now_perf - kf_predict_window_start) >= pred_log_interval_s:
+        kf_predict_window_s = max(1e-6, now_perf - kf_predict_window_start)
+        kf_predict_hz_window = kf_predict_count_window / kf_predict_window_s
+        logging.info(
+          "kf_hz_predict window=%.2f ema=%.2f inst=%.2f n=%d",
+          kf_predict_hz_window,
+          kf_predict_hz_ema,
+          kf_predict_hz_inst,
+          kf_predict_count_window,
+        )
+        kf_predict_count_window = 0
+        kf_predict_window_start = now_perf
       vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
       cv2.putText(
         vis_bgr,
@@ -494,6 +635,38 @@ def main():
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
         (0, 255, 255),
+        2,
+      )
+      cv2.putText(
+        vis_bgr,
+        f"kf_upd_ema={kf_update_hz_ema:.2f} kf_upd={kf_update_hz_inst:.2f}",
+        (8, 48),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 0),
+        2,
+      )
+      cv2.putText(
+        vis_bgr,
+        f"kf_pred_ema={kf_predict_hz_ema:.2f} kf_pred={kf_predict_hz_inst:.2f}",
+        (8, 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 0),
+        2,
+      )
+      if pose is not None:
+        px, py, pz = float(pose[0, 3]), float(pose[1, 3]), float(pose[2, 3])
+        pose_text = f"pose x={px:.2f} y={py:.2f} z={pz:.2f}"
+      else:
+        pose_text = "pose=NA"
+      cv2.putText(
+        vis_bgr,
+        pose_text,
+        (8, 96),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
         2,
       )
       last_vis_bgr = vis_bgr.copy()
@@ -516,6 +689,7 @@ def main():
         kf_6d = None
         kf_mean = None
         kf_cov = None
+        kf_continue_frames = 0
         last_cutie_bbox = None
         last_state = "waiting_init"
         last_reason = "manual_clear"

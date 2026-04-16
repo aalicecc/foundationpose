@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -56,6 +57,26 @@ class CutieTracker:
     self.cutie = get_default_model()
     self.cutie_processor = InferenceCore(self.cutie, cfg=self.cutie.cfg)
     self.cutie_processor.max_internal_size = int(max_internal_size)
+    self.last_mask_u8: Optional[np.ndarray] = None
+
+  def _empty_mask(self, shape_hw) -> np.ndarray:
+    h, w = int(shape_hw[0]), int(shape_hw[1])
+    return np.zeros((h, w), dtype=np.uint8)
+
+  def _output_prob_to_mask_safe(self, output_prob, shape_hw) -> np.ndarray:
+    if output_prob is None:
+      return self._empty_mask(shape_hw)
+    prob_shape = getattr(output_prob, "shape", None)
+    if prob_shape is None or len(prob_shape) < 3 or int(prob_shape[0]) <= 1:
+      return self._empty_mask(shape_hw)
+    try:
+      mask = self.cutie_processor.output_prob_to_mask(
+        output_prob,
+        segment_threshold=self.cutie_seg_threshold,
+      )
+      return mask.cpu().numpy().astype(np.uint8)
+    except IndexError:
+      return self._empty_mask(shape_hw)
 
   def initialize(
     self,
@@ -64,14 +85,21 @@ class CutieTracker:
     mask_visualization_path: Optional[str] = None,
     bbox_visualization_path: Optional[str] = None,
   ) -> List[int]:
+    init_mask_np = np.asarray(init_info["mask"]).astype(np.uint8)
+    objects = np.unique(init_mask_np)
+    objects = objects[objects != 0].tolist()
+    if len(objects) == 0:
+      logging.warning("Cutie initialize skipped: empty init mask.")
+      mask_np = self._empty_mask(init_frame.shape[:2])
+      self.last_mask_u8 = mask_np.copy()
+      return [-1, -1, 0, 0]
+
     with torch.no_grad():
       init_frame_tensor = to_tensor(init_frame).cuda().float()
-      init_mask_tensor = torch.from_numpy(init_info["mask"]).cuda()
-      objects = np.unique(init_info["mask"])
-      objects = objects[objects != 0].tolist()
+      init_mask_tensor = torch.from_numpy(init_mask_np).cuda()
       output_prob = self.cutie_processor.step(init_frame_tensor, init_mask_tensor, objects=objects)
-      mask = self.cutie_processor.output_prob_to_mask(output_prob, segment_threshold=self.cutie_seg_threshold)
-      mask_np = mask.cpu().numpy()
+      mask_np = self._output_prob_to_mask_safe(output_prob, init_frame.shape[:2])
+    self.last_mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
     bbox_xywh = self._parse_output(mask_np)
     init_frame = init_frame.copy()
     if mask_visualization_path is not None:
@@ -90,8 +118,8 @@ class CutieTracker:
     with torch.no_grad():
       frame_tensor = to_tensor(frame).cuda().float()
       output_prob = self.cutie_processor.step(frame_tensor)
-      mask = self.cutie_processor.output_prob_to_mask(output_prob, segment_threshold=self.cutie_seg_threshold)
-      mask_np = mask.cpu().numpy()
+      mask_np = self._output_prob_to_mask_safe(output_prob, frame.shape[:2])
+    self.last_mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
     bbox_xywh = self._parse_output(mask_np)
     frame = frame.copy()
     if mask_visualization_path is not None:

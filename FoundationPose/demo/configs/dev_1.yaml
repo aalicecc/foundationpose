@@ -20,8 +20,7 @@ sync:
   tolerance_ms: 33.0
 
 mesh:
-  file: "../../assets/meshes/pika/pika_origin.obj"
-  # file: "../../assets/meshes/bottle/bottle.obj"
+  file: "../../assets/meshes/bottle/bottle.obj"
 
 fastsam:
   model_path: "../../third_party/FastSAM/weights/FastSAM-s.pt"
@@ -74,7 +73,7 @@ performance:
 visualization:
   axis_scale_m: 0.1
   axis_thickness: 3
-  show_cutie_mask_overlay: true
+  show_cutie_mask_overlay: false
   cutie_mask_alpha: 0.35
 
 offline:
